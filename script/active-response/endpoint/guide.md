@@ -1,346 +1,91 @@
-# Wazuh 5.0 Custom Active Response: Automatic User Logoff
+# Wazuh 5.0 Active Response — C-Based Script Implementation Guide
+
+A concise reference for building, deploying, and testing native C-based Active Response executables on Wazuh 5.0 endpoints.
+
+---
 
 ## Overview
 
-This guide walks you through building and deploying a **production-grade Windows active response script** that automatically logs off users when brute-force attacks are detected by Wazuh.
-
-**Problem Solved**: In Wazuh 5.0, PowerShell-to-exe converted scripts don't execute immediately due to broken STDIN/STDOUT pipes with `wazuh-execd`. This native C implementation follows the official Wazuh architecture and works identically to built-in scripts like `block-ip.exe`.
+Active responses in Wazuh 5.0 are triggered through the Dashboard's **Per-Document Monitors** and pushed as structured JSON payloads to target agents. The agent-side daemon responsible for handling these is `wazuh-execd`, which forks a child process and pipes the full alert metadata directly to the script via `stdin`.
 
 ---
 
-## Prerequisites
+## How `wazuh-execd` Works
 
-### Required Software
-- **Windows Client** with Wazuh Agent 5.0 installed
-- **C Compiler** (choose one):
-  - **Visual Studio 2019/2022** (recommended) - [Download Community Edition](https://visualstudio.microsoft.com/downloads/)
-  - **MinGW-w64** - [Download](https://www.mingw-w64.org/)
-
-### Required Libraries
-- **cJSON** - Lightweight JSON parser (we'll download this)
+- Forks a child process and opens a `stdin` pipe to pass the full JSON alert payload.
+- Positional CLI arguments (`argv[1]`, `argv[2]`) are **ignored entirely** — all input must be read from `stdin`.
+- Scripts must read and act on a `command` field in the JSON payload, which declares the intended action: `"enable"` (apply mitigation) or `"disable"` (rollback mitigation).
 
 ---
 
-## Part 1: Download Dependencies
+## Core Requirements
 
-### Step 1.1: Get cJSON Library
+Every production-grade C active response binary must satisfy the following:
 
-Download the cJSON source files (just 2 files):
+### Windows DLL Hardening
+On any `WIN32` build, the very **first line of logic inside `main()`** must call `enable_dll_verification()`. This protects elevated system processes from untrusted DLL injection.
 
-**Option A: Using PowerShell**
-```powershell
-# Create working directory
-New-Item -ItemType Directory -Force -Path C:\Temp\wazuh-ar
-cd C:\Temp\wazuh-ar
+### JSON Parsing
+Input must be parsed using a structured tokenizer — the standard within Wazuh is **cJSON** — following the Elastic Common Schema (ECS) field path hierarchy.
 
-# Download cJSON files
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/DaveGamble/cJSON/master/cJSON.c" -OutFile "cJSON.c"
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/DaveGamble/cJSON/master/cJSON.h" -OutFile "cJSON.h"
-```
+### Exit Codes
+`wazuh-execd` evaluates exit codes strictly:
+- `0` (OS_SUCCESS) — fully completed execution
+- `1` (OS_INVALID / failure) — parsing errors, unauthorized inputs, or system-level failures
 
-**Option B: Manual Download**
-1. Go to https://github.com/DaveGamble/cJSON
-2. Download `cJSON.c` and `cJSON.h`
-3. Save both files to `C:\Temp\wazuh-ar\`
-
-### Step 1.2: Get the Active Response Script
-
-Save the `log-off.c` file (provided separately) to the same directory:
-```
-C:\Temp\wazuh-ar\
-├── cJSON.c
-├── cJSON.h
-└── log-off.c
-```
+### Logging
+All operational events must be appended to the platform-specific `active-responses.log` using direct file handlers (unbuffered, asynchronous). Log paths:
+- **Linux:** `/var/ossec/logs/active-responses.log`
+- **Windows:** `C:\Program Files (x86)\ossec-agent\active-response\active-responses.log`
 
 ---
 
-## Part 2: Compilation
+## Program Structure Summary
 
-### Option A: Using Visual Studio (Recommended)
+A compliant C active response binary should follow this logical flow:
 
-**Step 2.1**: Open **Developer Command Prompt for VS 2022** (or your VS version)
-- Search for "Developer Command Prompt" in Start menu
-- Run as Administrator
-
-**Step 2.2**: Navigate to your working directory
-```cmd
-cd C:\Temp\wazuh-ar
-```
-
-**Step 2.3**: Compile the script
-```cmd
-cl /O2 /W3 log-off.c cJSON.c /Fe:log-off.exe wtsapi32.lib
-```
-
-**Expected Output**:
-```
-Microsoft (R) C/C++ Optimizing Compiler Version...
-log-off.c
-cJSON.c
-Generating Code...
-Microsoft (R) Incremental Linker Version...
-```
+1. On Windows, call `enable_dll_verification()` immediately.
+2. Read the entire JSON payload from `stdin` using `fread`.
+3. Parse the JSON with cJSON; log and exit `1` on any parse failure.
+4. Extract and validate the `command` field — reject anything other than `"enable"` or `"disable"`.
+5. Traverse the JSON hierarchy to extract the target IP, following the ECS path: `wazuh → active_response → parameters → alert → _source → source → ip`. Fall back to the root-level `source.ip` field if the nested path is absent.
+6. If no valid target IP is found, log an error and exit `1`.
+7. Execute the remediation or rollback logic based on the `command` value.
+8. Log the outcome and exit `0` on success, `1` on failure.
 
 ---
 
-### Option B: Using MinGW
+## Build & Deployment
 
-**Step 2.1**: Open Command Prompt as Administrator
+### Linux
+- Install dependencies: `libcjson-dev` and `gcc`.
+- Compile the binary and place it in `/var/ossec/active-response/bin/`.
+- Set permissions to `750` with ownership `root:wazuh`.
 
-**Step 2.2**: Navigate to your working directory
-```cmd
-cd C:\Temp\wazuh-ar
-```
-
-**Step 2.3**: Compile the script
-```cmd
-gcc -O2 -Wall log-off.c cJSON.c -o log-off.exe -lwtsapi32
-```
-
-**Expected Output**:
-```
-(No output means success)
-```
+### Windows (Cross-compiled from Linux)
+- Install the `mingw-w64` cross-compilation toolchain.
+- Compile targeting `x86_64-w64-mingw32-gcc` with the `WIN32` preprocessor flag.
+- Deploy the resulting `.exe` to `C:\Program Files (x86)\ossec-agent\active-response\bin\`.
 
 ---
 
-### Verify Compilation
+## Local Testing
 
-Check that `log-off.exe` was created:
-```cmd
-dir log-off.exe
-```
+Before wiring the script to the Wazuh Indexer Dashboard, validate it locally by simulating the `stdin` pipe directly from the terminal.
 
-You should see:
-```
-05/22/2026  10:30 AM           45,056 log-off.exe
-```
+Pipe a JSON payload with `command` set to `"enable"` or `"disable"` and a `source.ip` value directly into the compiled binary. After execution, inspect `active-responses.log` to confirm the expected log entries appear with correct timestamps and action labels.
+
+Both the nested ECS path and the flat root-level fallback path for `source.ip` should be tested separately to confirm graceful handling of both schema variants.
 
 ---
 
-## Part 3: Deployment to Wazuh Agent
+## Key File Paths Reference
 
-### Step 3.1: Stop the Wazuh Agent Service
-
-```powershell
-Stop-Service -Name WazuhSvc
-```
-
-### Step 3.2: Backup Old Script (if exists)
-
-```powershell
-# Backup your old PS2EXE version
-$oldScript = "C:\Program Files (x86)\ossec-agent\active-response\bin\log-off.exe"
-if (Test-Path $oldScript) {
-    Copy-Item $oldScript "$oldScript.backup"
-}
-```
-
-### Step 3.3: Deploy the New Executable
-
-```powershell
-# Copy the new native C executable
-Copy-Item "C:\Temp\wazuh-ar\log-off.exe" "C:\Program Files (x86)\ossec-agent\active-response\bin\log-off.exe" -Force
-```
-
-### Step 3.4: Set Permissions
-
-```powershell
-# Verify SYSTEM account has execute permissions
-$acl = Get-Acl "C:\Program Files (x86)\ossec-agent\active-response\bin\log-off.exe"
-$permission = "NT AUTHORITY\SYSTEM","FullControl","Allow"
-$accessRule = New-Object System.Security.AccessControl.FileSystemAccessRule $permission
-$acl.SetAccessRule($accessRule)
-Set-Acl "C:\Program Files (x86)\ossec-agent\active-response\bin\log-off.exe" $acl
-```
-
-### Step 3.5: Start the Wazuh Agent Service
-
-```powershell
-Start-Service -Name WazuhSvc
-```
+| Purpose | Linux Path | Windows Path |
+|---|---|---|
+| Active response binaries | `/var/ossec/active-response/bin/` | `C:\Program Files (x86)\ossec-agent\active-response\bin\` |
+| Active response log | `/var/ossec/logs/active-responses.log` | `C:\Program Files (x86)\ossec-agent\active-response\active-responses.log` |
 
 ---
 
-## Part 4: Configure Active Response on Wazuh Manager
-
-### Step 4.1: Define the Command
-
-On your **Wazuh Manager (Ubuntu)**, edit the configuration:
-
-```bash
-sudo nano /var/ossec/etc/ossec.conf
-```
-
-Add this command definition inside the `<ossec_config>` block:
-
-```xml
-<command>
-  <name>logoff-command</name>
-  <executable>log-off.exe</executable>
-  <timeout_allowed>no</timeout_allowed>
-</command>
-```
-
-### Step 4.2: Bind the Command to Your Detection Rule
-
-Add this active response binding (replace `100002` with your actual Hydra detection rule ID):
-
-```xml
-<active-response>
-  <command>logoff-command</command>
-  <location>local</location>
-  <rules_id>100002</rules_id>
-</active-response>
-```
-
-### Step 4.3: Restart Wazuh Manager
-
-```bash
-sudo systemctl restart wazuh-manager
-```
-
----
-
-## Part 5: Testing
-
-### Step 5.1: Clear Old Logs
-
-On your **Windows Client**:
-
-```powershell
-# Clear the debug log
-Remove-Item "C:\Program Files (x86)\ossec-agent\active-response\bin\logoff-debug.log" -ErrorAction SilentlyContinue
-```
-
-### Step 5.2: Trigger the Attack
-
-From your **attacker machine** (e.g., Kali Linux):
-
-```bash
-hydra -l johndoe -P /usr/share/wordlists/rockyou.txt rdp://192.168.1.100
-```
-
-**Important**: Make sure `johndoe` is actually logged into the Windows client.
-
-### Step 5.3: Observe Real-Time Response
-
-**Within 30 seconds**, you should see:
-
-1. ✅ **Windows Client**: User `johndoe` gets immediately logged off (no restart needed!)
-2. ✅ **Debug Log**: `logoff-debug.log` shows execution logs
-3. ✅ **OpenSearch Dashboard**: Alert fires and shows active response triggered
-
----
-
-## Part 6: Verification
-
-### Check the Debug Log
-
-On **Windows Client**:
-
-```powershell
-Get-Content "C:\Program Files (x86)\ossec-agent\active-response\bin\logoff-debug.log" -Tail 20
-```
-
-**Expected Output** (should appear within 30 seconds of attack):
-
-```
-2026-05-22 14:23:15 log-off: Starting
-2026-05-22 14:23:15 log-off: {"command":"enable","user":{"name":"johndoe"},...}
-2026-05-22 14:23:15 log-off: Target user: johndoe
-2026-05-22 14:23:15 log-off: {"version":1,"origin":{"name":"log-off","module":"active-response"},"command":"check_keys","parameters":{"keys":["johndoe"]}}
-2026-05-22 14:23:15 log-off: {"command":"continue"}
-2026-05-22 14:23:15 log-off: Found session ID: 2
-2026-05-22 14:23:15 log-off: SUCCESS: Logged off session 2
-```
-
-### Check OpenSearch Alert
-
-Go to **OpenSearch Dashboards** → **Wazuh** → **Security Events**
-
-Search for:
-```
-rule.id: 100002
-```
-
-You should see:
-- Alert with `user.name: johndoe`
-- `rule.description` matching your Hydra detection
-- Timestamp matching the attack time
-
----
-
-## Troubleshooting
-
-### Issue 1: Script Not Executing
-
-**Symptom**: No entries in `logoff-debug.log` after attack
-
-**Check**:
-```powershell
-# Verify the executable exists
-Test-Path "C:\Program Files (x86)\ossec-agent\active-response\bin\log-off.exe"
-
-# Check Wazuh agent is running
-Get-Service WazuhSvc
-```
-
-**Fix**:
-- Restart the agent: `Restart-Service WazuhSvc`
-- Check manager configuration matches the command name exactly
-
----
-
-### Issue 2: "Cannot Read Response from Execd"
-
-**Symptom**: Log shows `"Cannot read response from execd"`
-
-**Cause**: The deduplication handshake failed
-
-**Check Manager Logs**:
-```bash
-sudo tail -f /var/ossec/logs/ossec.log | grep active-response
-```
-
-**Fix**:
-- Verify your Wazuh Manager is version 5.0+
-- Ensure `wazuh-manager` service is running
-
---->
-
-Ensure Sysmon or Windows Event Logs provide the target username in the event.
-
----
-
-### Issue 3: "No Active Session"
-
-**Symptom**: Log shows `"No active session for johndoe"`
-
-**Cause**: The user isn't actually logged in
-
-**Fix**:
-- Log into Windows as `johndoe` before testing
-- Use `query user` to verify active sessions:
-  ```cmd
-  query user
-  ```
-
----
-
-## Architecture Comparison
-
-### Your Old PS2EXE Script vs. Native C Implementation
-
-| Component | PS2EXE Wrapper | Native C (This Guide) |
-|-----------|----------------|----------------------|
-| **STDIN Read** | ✅ Works | ✅ Works |
-| **Deduplication Protocol** | ❌ Missing | ✅ Full implementation |
-| **Bidirectional Pipe** | ❌ Broken | ✅ Native stdio |
-| **stdout Flush** | ❌ Not in wrapper | ✅ Explicit `fflush()` |
-| **Execution Timing** | ❌ Queued until restart | ✅ Immediate (<5 seconds) |
-| **Version Metadata** | ❌ Missing | ✅ Version 1 + origin tracking |
-| **Log File** | ⚠️ Shared (locked) | ✅ Separate debug log |
-
----
+*This guide reflects Wazuh 5.0 architectural standards for C-based active response development. For script-level implementation details, refer to the accompanying `custom_active_response.c` source template.*
