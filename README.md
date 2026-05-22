@@ -45,6 +45,9 @@ In traditional setups, the Wazuh Manager relies on localized analysis configurat
 
 ---
 
+## 🛠️ Link to how to create and setup on Wazuh Dashboard
+https://github.com/wazuh/wazuh-dashboard-plugins/blob/main/docs/ref/modules/active-response/create.md 
+
 ## 💻 Script Specifications & Best Practices
 
 All integration scripts added to `/var/ossec/active-response/bin/` (Linux) or `C:\Program Files (x86)\ossec-agent\active-response\bin\` (Windows) strictly adhere to production-grade engineering constraints:
